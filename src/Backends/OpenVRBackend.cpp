@@ -80,6 +80,11 @@ gamescope::ConVar<uint32_t> cv_vr_poll_rate( "vr_poll_rate", 50ul, "Max time bet
 extern std::atomic<uint64_t> g_FocusedVROverlayMouse;
 extern std::atomic<uint64_t> g_FocusedVROverlayKeyboard;
 
+// static vr::HmdVector2_t HmdVecFromGlmVec( glm::vec2 vec )
+// {
+//     return { vec.x, vec.y };
+// }
+
 // Not in public headers yet.
 namespace vr
 {
@@ -282,6 +287,9 @@ namespace gamescope
         uint32_t GetSortOrder() const { return m_uSortOrder; }
         bool IsSubview() const { return m_bIsSubview; }
 
+        glm::vec2 GetLastPresentedSrcSize() const { return m_vecLastPresentedSrcSize; }
+        glm::vec2 GetLastPresentedDstSize() const { return m_vecLastPresentedDstSize; }
+
         COpenVRBackend *GetBackend() const { return m_pBackend; }
         COpenVRConnector *GetConnector() const { return m_pConnector; }
 
@@ -306,6 +314,9 @@ namespace gamescope
         std::mutex m_mutFbIds;
         Rc<COpenVRFb> m_pQueuedFbId;
         Rc<COpenVRFb> m_pVisibleFbId;
+
+        glm::vec2 m_vecLastPresentedSrcSize = { 0.f, 0.f };
+        glm::vec2 m_vecLastPresentedDstSize = { 0.f, 0.f };
     };
 
     class COpenVRConnector final : public CBaseBackendConnector, public INestedHints
@@ -1459,12 +1470,55 @@ namespace gamescope
 
                 if (bUsingPhysicalMouse && bShowCursor)
                 {
+                    //     {
+                    //         static_cast<float>(wlserver.mouse_surface_cursorx),
+                    //         static_cast<float>(static_cast<double>(g_nOutputHeight) - wlserver.mouse_surface_cursory),
+                    //     };
+
                     vr::HmdVector2_t vMousePos =
                         {
                             static_cast<float>(wlserver.mouse_surface_cursorx),
                             static_cast<float>(static_cast<double>(g_nOutputHeight) - wlserver.mouse_surface_cursory),
                         };
 
+                    COpenVRPlane *pPlane = pConnector->GetPrimaryPlane();
+                    if ( pPlane )
+                    {
+                        // openvr_log.debugf( "drewg - ADJUSTING SIZE. (lastPresented: %f x %f) (output: %f x %f) (before: %f x %f)",
+                        //     (float)pPlane->GetLastPresentedSize().x,
+                        //     (float)pPlane->GetLastPresentedSize().y,
+                        //     (float)g_nOutputWidth,
+                        //     (float)g_nOutputHeight,
+                        //     vMousePos.x,
+                        //     vMousePos.y
+                        // );
+                        // vMousePos *= ( pPlane->GetLastPresentedSize() / glm::vec2{ (float)g_nOutputWidth, (float)g_nOutputHeight });
+
+                        auto srcSize = pPlane->GetLastPresentedSrcSize();
+                        auto dstSize = pPlane->GetLastPresentedDstSize();
+                        if ( srcSize.x > 0 && srcSize.y > 0 && dstSize.x > 0 && dstSize.y > 0 )
+                        {
+                            glm::vec2 vecScale = dstSize / srcSize;
+                            vMousePos.v[0] = static_cast<float>( wlserver.mouse_surface_cursorx * vecScale.x );
+                            vMousePos.v[1] = static_cast<float>( double(dstSize.y) - ( wlserver.mouse_surface_cursory * vecScale.y ) );
+                        }
+                    }
+                    else openvr_log.debugf( "drewg - NO PLANE!" );
+
+                    auto srcSize = pPlane->GetLastPresentedSrcSize();
+                    auto dstSize = pPlane->GetLastPresentedDstSize();
+                    openvr_log.debugf(
+                        "drewg - SetOverlayCursorPositionOverride \"%s\" (pos: %f x %f) (srcSize: %f x %f) (dstSize mouseScale: %f x %f) (g_nOutputHeight: %f)",
+                        this->GetOverlayName(),
+                        vMousePos.v[0], vMousePos.v[1],
+                        srcSize.x, srcSize.y, 
+                        dstSize.x, dstSize.y,
+                        // vMousePos.x, vMousePos.y,
+                        (float)g_nOutputHeight
+                    );
+
+                    // vr::HmdVector2_t vVRMousePos = HmdVecFromGlmVec( vMousePos );
+                    // vr::VROverlay()->SetOverlayCursorPositionOverride(pConnector->GetPrimaryPlane()->GetOverlay(), &vVRMousePos);
                     vr::VROverlay()->SetOverlayCursorPositionOverride(pConnector->GetPrimaryPlane()->GetOverlay(), &vMousePos);
                     pConnector->m_bCurrentlyOverridingPosition = true;
                 }
@@ -2085,7 +2139,6 @@ namespace gamescope
 
     void COpenVRPlane::Present( std::optional<OpenVRPlaneState> oState )
     {
-        
         if ( oState )
         {
             vr::VROverlay()->SetOverlayAlpha( m_hOverlay, oState->flAlpha );
@@ -2094,11 +2147,20 @@ namespace gamescope
             {
                 vr::VROverlay()->SetOverlayFlag( m_hOverlay, vr::VROverlayFlags_IgnoreTextureAlpha,	oState->bOpaque || !DRMFormatHasAlpha( oState->pTexture->drmFormat() ) || cv_vr_debug_force_opaque );
 
+                m_vecLastPresentedSrcSize = { oState->flSrcWidth, oState->flSrcHeight };
+                m_vecLastPresentedDstSize = { (float)oState->nDstWidth, (float)oState->nDstHeight };
+
                 vr::HmdVector2_t vMouseScale =
                 {
                     float( oState->nDstWidth ),
                     float( oState->nDstHeight ),
                 };
+                openvr_log.debugf(
+                    "drewg - Present (srcSize: %f x %f) (dstSize mouseScale: %f x %f)",
+                    m_vecLastPresentedSrcSize.x, m_vecLastPresentedSrcSize.y, 
+                    m_vecLastPresentedDstSize.x, m_vecLastPresentedDstSize.y
+                    // vMouseScale.v[0], vMouseScale.v[1]
+                );
                 vr::VROverlay()->SetOverlayMouseScale( m_hOverlay, &vMouseScale );
                 vr::VRTextureBounds_t vTextureBounds =
                 {
